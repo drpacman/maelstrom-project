@@ -4,10 +4,10 @@ pub mod crdt_server {
     use serde::{Deserialize};
     use serde_json::{Value, json};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{ Instant, Duration };
     use std::sync::mpsc;
-    use crate::node::node::{Node, Init, Message};                          
-
+    use crate::node::node::{Node, Server, Message};                          
+    
     #[derive(Deserialize)]
     struct Replicate {
         #[serde(rename="type")]
@@ -43,111 +43,72 @@ pub mod crdt_server {
         }
     }
 
-    pub struct Server<T : CRDT >{
-        server : Option<Node>,
+    pub struct CRDTServer<T : CRDT >{
+        node : Option<Node>,
         crdt : T,
-        handler: fn(&String, &mut T, &Message) -> Value
+        handler: fn(&String, &mut T, &Message) -> Value,
+        last_replication: Instant
     }
 
-    impl<T : CRDT>  Server<T>  {
-        pub fn new(crdt : T, handler: fn(&String, &mut T, &Message) -> Value ) -> Server<T> {
-            Server {
-                server : None,
+    impl<T : CRDT>  CRDTServer<T>  {
+        pub fn new(crdt : T, handler: fn(&String, &mut T, &Message) -> Value ) -> CRDTServer<T> {
+            CRDTServer {
+                node : None,
                 crdt : crdt,
-                handler : handler
+                handler : handler,
+                last_replication: Instant::now()
             }
         }
 
-        pub fn run(mut self) {
-            let (input_tx, input_rx) = mpsc::channel();
-            thread::spawn(move || {
-                loop {
-                    let mut buffer = String::new();
-                    match io::stdin().read_line(&mut buffer) {
-                        Ok(_n) => {
-                            match serde_json::from_str::<Message>(buffer.as_str()) {
-                                Ok(msg) => {
-                                    input_tx.send(msg).expect("Failed to send message read from command line");
-                                },
-                                Err(error) => {
-                                    debug(format!("Invalid JSON {} {}", buffer, error));
-                                }
-                            };
-                            ()
-                        },
-                        Err(_error) => panic!("Failed to read from stdin")
-                    }
+        fn replicate(&self) {
+            debug("Replicating".to_string());
+            let node_ref = self.node.as_ref().unwrap();
+            for neighbour in node_ref.node_ids.iter() {
+                if neighbour.to_string() !=  node_ref.node_id {
+                    node_ref.send_to_node_noack(
+                        json!({ "type" : "replicate", "value": &self.crdt.to_json() }
+                    ), &neighbour);
                 }
-            });   
-            let (replicate_tx, replicate_rx) = mpsc::channel();
-            thread::spawn(move || {
-                loop {
-                    replicate_tx.send(()).expect("Failed to send replication ping");
-                    thread::sleep(Duration::from_secs(5));
-                }
+            }
+        }        
+    }
 
-            });
-            loop {
-                match input_rx.try_recv() {
-                    Ok(msg) => {
-                        &self.process_message(msg);
-                    },
-                    _ => ()
-                };
-                match replicate_rx.try_recv() {
-                    Ok(_x) => {
-                        debug("Replicating".to_string());
-                        match &self.server {
-                            Some(s) => {
-                                for neighbour in s.node_ids.iter() {
-                                    if neighbour.to_string() != s.node_id {
-                                        s.send_to_node_noack(json!({ "type" : "replicate", "value": &self.crdt.to_json() }), &neighbour);
-                                    }
-                                }
-                            },
-                            None => ()
-                        }
-                    },
-                    _ => ()
-                };
-            }   
+    impl<T: CRDT + Send + 'static>  Server for CRDTServer<T>  {
+    
+        fn ack(&mut self, msg_id : u64) {}
+        
+        fn start(&mut self, node : Node) {
+            self.node = Some(node);
+            self.last_replication = Instant::now();
+        }
+
+        fn notify(&mut self) {
+            let now = Instant::now();
+            if now.duration_since(self.last_replication).as_secs() > 5 {
+                self.last_replication = now;
+                self.replicate();
+            };
         }    
 
         fn process_message(&mut self, msg : Message ) {
+            let n = self.node.as_ref().unwrap();
             match msg.body.get("in_reply_to") {
                 Some(msg_id) => {
-                    match &self.server {
-                        Some(s) => s.acked(msg_id.as_u64().unwrap()),
-                        None => panic!("Missing server")
-                    }                
+                    n.acked(msg_id.as_u64().unwrap());
                 },
                 _ => {
                     match msg.body["type"].as_str() {
-                        Some("init") => {
-                            let init : Init = serde_json::from_value(msg.body.clone()).unwrap();
-                            let s : Node = Node::new(&init);
-                            s.send( init.response(), &msg );
-                            self.server=Some(s);                              
-                        },
                         Some("replicate") => {
                             let repl : Replicate = serde_json::from_value(msg.body.clone()).unwrap();
                             self.crdt.merge(T::from_json(repl.value));
                         },
                         Some("read") => {
                             let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
-                            match &self.server {
-                                Some(s) => s.send(read.response(self.crdt.read()), &msg ),
-                                None => panic!("Missing server")
-                            }
+                            n.send(read.response(self.crdt.read()), &msg );
                         }
                         _ => {
-                            match &self.server {
-                                Some(s) => {
-                                    let resp = (self.handler)(&s.node_id, &mut self.crdt, &msg);
-                                    s.send(resp, &msg);
-                                },
-                                None => panic!("Missing server")
-                            }
+                            let resp = (self.handler)(&n.node_id, &mut self.crdt, &msg);
+                            n.send(resp, &msg);
                         }
                     }
                 }            

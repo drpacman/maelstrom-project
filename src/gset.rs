@@ -6,7 +6,7 @@ use std::collections::HashSet;
 mod node; 
 use crate::node::node::Message;
 mod crdt_server;                       
-use crate::crdt_server::crdt_server::{CRDT, Server};
+use crate::crdt_server::crdt_server::{CRDT, CRDTServer};
 
 #[derive(Deserialize)]
 struct Add {
@@ -78,7 +78,7 @@ fn process_message(_node_id : &String, crdt : &mut GSet, msg : &Message) -> Valu
 
 fn main() -> Result<()> {
     let crdt = GSet{ set : HashSet::new() };
-    let server : Server<GSet> = Server::new(crdt, process_message);   
-    server.run();
+    let server = CRDTServer::new(crdt, process_message);   
+    node::node::run(server);
     Ok(())
 }

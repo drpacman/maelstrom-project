@@ -6,7 +6,7 @@ use std::collections::HashMap;
 mod node; 
 use crate::node::node::Message;   
 mod crdt_server;                       
-use crate::crdt_server::crdt_server::{CRDT, Server, debug};
+use crate::crdt_server::crdt_server::{CRDT, CRDTServer, debug};
 
 #[derive(Deserialize)]
 struct Add {
@@ -137,7 +137,7 @@ fn process_message(node_id : &String, crdt : &mut PNCounter, msg : &Message) -> 
 
 fn main() -> Result<()> {
     let crdt = PNCounter::new();
-    let server : Server<PNCounter> = Server::new(crdt, process_message);   
-    server.run();
+    let server = CRDTServer::new(crdt, process_message);   
+    node::node::run(server);
     Ok(())
 }

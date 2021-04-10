@@ -8,6 +8,7 @@ pub mod node {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+    use std::sync::{ Arc, Mutex };
 
     #[derive(Deserialize)]
     pub struct Init {
@@ -42,6 +43,62 @@ pub mod node {
         pub node_ids: Vec<String>,
         pub node_id: String,
         tx: std::sync::mpsc::Sender<Messages>,
+    }
+
+    pub trait Server {
+        fn ack(&mut self, msg_id : u64);
+        fn start(&mut self, node : Node);
+        fn process_message(&mut self, msg : Message);
+        fn notify(&mut self);
+    }
+
+    pub fn run<T : Server>(mut server : T) {
+        let (input_tx, input_rx) = mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                let mut buffer = String::new();
+                match io::stdin().read_line(&mut buffer) {
+                    Ok(_n) => {
+                        match serde_json::from_str::<Message>(buffer.as_str()) {
+                            Ok(msg) => {
+                                input_tx.send(msg).expect("Failed to send message read from command line");
+                            },
+                            Err(error) => {
+                                debug(format!("Invalid JSON {} {}", buffer, error));
+                            }
+                        };
+                        ()
+                    },
+                    Err(_error) => panic!("Failed to read from stdin")
+                }
+            }
+        });   
+        loop {
+            match input_rx.try_recv() {
+                Ok(msg) => {
+                    match msg.body.get("in_reply_to") {
+                        Some(msg_id) => {
+                            server.ack(msg_id.as_u64().unwrap());
+                        },
+                        None => {
+                            match msg.body["type"].as_str() {
+                                Some("init") => {
+                                    let init : Init = serde_json::from_value(msg.body.clone()).unwrap();
+                                    let node : Node = Node::new(&init);
+                                    node.send( init.response(), &msg );
+                                    server.start(node);                        
+                                },
+                                _ => {
+                                    server.process_message(msg);
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => ()
+            };
+            server.notify();
+        }
     }
 
     fn send_message(resp: &Message) -> () {
@@ -120,8 +177,6 @@ pub mod node {
     }
 
     fn debug(msg: String) {
-        io::stderr()
-            .write(msg.as_bytes())
-            .expect("Failed to write debug");
+        io::stderr().write(msg.as_bytes()).expect("Failed to write debug");
     }
 }
