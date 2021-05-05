@@ -30,7 +30,7 @@ struct ReadOk {
     #[serde(rename="type")]
     #[allow(dead_code)]
     type_ : String,
-    value: Vec<i64>,
+    value: HashMap<u64, Vec<i64>>,
     in_reply_to: u32
 }
 
@@ -48,64 +48,62 @@ impl DatomicServer {
         }
     }
 
-    fn transact(&self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
+    fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
+        let node = self.node.as_ref().unwrap();
+        let resp = node.send_to_node_sync(json!({ "type": "read", "key": "root"}), "lin-kv".to_string());
+        if resp["type"] == "read_ok" {
+            let read_ok : ReadOk = serde_json::from_value(resp).expect("Not a read ok response");
+            self.state = read_ok.value;
+        }
+        let (result, updated_state) = self.apply_transaction(txn);
+        let cas_resp = node.send_to_node_sync(json!({ 
+            "type": "cas", 
+            "key": "root", 
+            "from": self.state,
+            "to" : updated_state,
+            "create_if_not_exists" : true
+        }), "lin-kv".to_string());
+        node::node::debug(format!("\nReceived CAS response {:?}", cas_resp));
+        if cas_resp["type"].as_str().unwrap() != "cas_ok" {
+            return Err("Failed to CAS");
+        }
+        node::node::debug(format!("\nTxn complete {:?}", txn));     
+        Ok(result)
+    }
+
+    fn apply_transaction(&self, txn : &Vec<Value>) -> (Vec<Value>, HashMap<u64, Vec<i64>>) {
         let mut result = Vec::new();
+        let mut new_state = self.state.clone();
+                        
         for entry in txn.into_iter() {
             if let [ f, k, v ] = entry.as_array().expect("Entry should be an array").as_slice() {
                 let action = f.as_str().expect("Action should be a string");
                 let key = k.as_u64().expect("Key should be a u64");
-                node::node::debug(format!("\nAction {:?}\n", action));
+                let entry = new_state.get(&key);
                 match action {
                     "r" => {
-                        let n = self.node.as_ref().unwrap();
-                        let resp = n.send_to_node_sync(json!({ "type": "read", "key": key}), "lin-kv".to_string());
-                        if resp["type"] == "read_ok" {
-                            let read_ok : ReadOk = serde_json::from_value(resp).expect("Not a read ok response");
-                            result.push(json!([ action, key, read_ok.value ]));
-                        } else {
-                            result.push(json!([ action, key, Value::Null ]));
-                        };
-                        
+                        match entry {
+                            Some(e) => result.push(json!([ action, key, e ])),
+                            None => result.push(json!([ action, key, Value::Null ]))
+                        }
                     },
                     "append" => {
                         let value = v.as_i64().expect("Append value should be a signed int");
                         result.push(json!([ action, key, v ]));                        
-                        let n = self.node.as_ref().unwrap();
-                        let resp = n.send_to_node_sync(json!({ "type": "read", "key": key}), "lin-kv".to_string());
-                        node::node::debug(format!("\nReceived Sync Response: {:?}", resp));
-                        let cas_resp = if resp["type"] == "read_ok" {
-                            let read_ok : ReadOk = serde_json::from_value(resp).expect("Not a read ok response");
-                            let existing = read_ok.value;
-                            let mut updated = existing.clone();                        
-                            updated.push(value);
-                            n.send_to_node_sync(json!({ 
-                                "type": "cas", 
-                                "key": key, 
-                                "from": existing,
-                                "to" : updated,
-                                "create_if_not_exists" : true
-                            }), "lin-kv".to_string())
-                        } else {
-                            n.send_to_node_sync(json!({ 
-                                "type": "cas", 
-                                "key": key, 
-                                "to" : vec![value],
-                                "create_if_not_exists" : true
-                            }), "lin-kv".to_string())
+                        let mut updated_entry = match entry {
+                            Some(e) => e.clone(),
+                            None =>Vec::new()
                         };
-                        node::node::debug(format!("\nReceived CAS response {:?}", cas_resp));
-                        if cas_resp["type"].as_str().unwrap() != "cas_ok" {
-                            return Err("Failed to CAS");
-                        }
+                        updated_entry.push(value);
+                        new_state.insert(key, updated_entry);
                     },
                     _ => {
                         panic!(format!("unexpected action of ${:?}", action));
                     }
                 }
             }
-        };
-        node::node::debug(format!("\nTxn complete {:?}", txn));     
-        Ok(result)
+        }
+        (result, new_state)
     }
 }
 
@@ -119,20 +117,20 @@ impl Server for DatomicServer {
     }
 
     fn process_message(&mut self, msg : Message ) {
-       match msg.body["type"].as_str() {
+       let response = match msg.body["type"].as_str() {
             Some("txn") => {
                 let txn : Txn = serde_json::from_value(msg.body.clone()).unwrap();
                 let transaction_output = self.transact(&txn.txn);
-                let n = self.node.as_ref().unwrap();
                 match transaction_output {
-                    Ok(values) => n.send(txn.response(&values), &msg),
-                    Err(text) => n.send(txn.fail(&text.to_string()), &msg)
+                    Ok(values) => txn.response(&values),
+                    Err(text) => txn.fail(&text.to_string())
                 }
             },
             _ => {
                 panic!(format!("Unexpected message {:?}", msg));
             }
-        }
+        };                
+        self.node.as_ref().unwrap().send(response, &msg)
     }
     fn notify(&mut self){}
 }
