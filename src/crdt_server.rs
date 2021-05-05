@@ -3,11 +3,10 @@ pub mod crdt_server {
     use std::io::{self, Write};
     use serde::{Deserialize};
     use serde_json::{Value, json};
-    use std::thread;
-    use std::time::{ Instant, Duration };
-    use std::sync::mpsc;
+    use std::time::{ Instant };
     use crate::node::node::{Node, Server, Message};                          
-    
+    use std::cell::RefCell;
+
     #[derive(Deserialize)]
     struct Replicate {
         #[serde(rename="type")]
@@ -67,7 +66,7 @@ pub mod crdt_server {
                 if neighbour.to_string() !=  node_ref.node_id {
                     node_ref.send_to_node_noack(
                         json!({ "type" : "replicate", "value": &self.crdt.to_json() }
-                    ), &neighbour);
+                    ), neighbour.to_string());
                 }
             }
         }        
@@ -75,7 +74,9 @@ pub mod crdt_server {
 
     impl<T: CRDT + Send + 'static>  Server for CRDTServer<T>  {
     
-        fn ack(&mut self, msg_id : u64) {}
+        fn process_reply(&self) {
+            self.node.as_ref().unwrap().process_reply();
+        }
         
         fn start(&mut self, node : Node) {
             self.node = Some(node);
@@ -92,26 +93,19 @@ pub mod crdt_server {
 
         fn process_message(&mut self, msg : Message ) {
             let n = self.node.as_ref().unwrap();
-            match msg.body.get("in_reply_to") {
-                Some(msg_id) => {
-                    n.acked(msg_id.as_u64().unwrap());
+            match msg.body["type"].as_str() {
+                Some("replicate") => {
+                    let repl : Replicate = serde_json::from_value(msg.body.clone()).unwrap();
+                    self.crdt.merge(T::from_json(repl.value));
                 },
+                Some("read") => {
+                    let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
+                    n.send(read.response(self.crdt.read()), &msg );
+                }
                 _ => {
-                    match msg.body["type"].as_str() {
-                        Some("replicate") => {
-                            let repl : Replicate = serde_json::from_value(msg.body.clone()).unwrap();
-                            self.crdt.merge(T::from_json(repl.value));
-                        },
-                        Some("read") => {
-                            let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
-                            n.send(read.response(self.crdt.read()), &msg );
-                        }
-                        _ => {
-                            let resp = (self.handler)(&n.node_id, &mut self.crdt, &msg);
-                            n.send(resp, &msg);
-                        }
-                    }
-                }            
+                    let resp = (self.handler)(&n.node_id, &mut self.crdt, &msg);
+                    n.send(resp, &msg);
+                }
             }
         }
     }

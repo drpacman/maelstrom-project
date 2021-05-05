@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use serde::{Deserialize};
 use serde_json::{Value, Map, json};
 mod node;
-use crate::node::node::{Node, Init, Message};
+use crate::node::node::{Node, Server, Message};
                                 
 #[derive(Deserialize)]
 struct Topology {
@@ -52,81 +52,58 @@ fn debug(msg : String) {
     io::stderr().write(msg.as_bytes()).expect("Failed to write debug");
 }
 
-fn main() -> io::Result<()> {
-    let mut server : Option<Box<Node>> = None;
-    let mut msgs : Vec<u32> = Vec::new();
-    let mut neighbours : Vec<Value> = Vec::new();
-    loop {
-        let mut buffer = String::new();
-        match io::stdin().read_line(&mut buffer) {
-            Ok(_n) => {
-                match serde_json::from_str::<Message>(buffer.as_str()) {
-                    Ok(msg) => {
-                        debug(format!("Received {}\n", msg.body));
-                        match msg.body["type"].as_str() {
-                            Some("init") => {
-                                let init : Init = serde_json::from_value(msg.body.clone()).unwrap();
-                                let s : Node = Node::new(&init);
-                                s.send( init.response(), &msg );
-                                server = Some(Box::new(s))                                
-                            },
-                            Some("topology") => {
-                                let topology : Topology = serde_json::from_value(msg.body.clone()).unwrap();
-                                match &server {
-                                    Some(s) => {
-                                        neighbours = topology.topology[&s.node_id].as_array().unwrap().clone();
-                                        s.send( topology.response(), &msg );
-                                    },
-                                    None => panic!("Missing server")
-                                }
-                            },
-                            Some("broadcast") => {
-                                let broadcast : Broadcast = serde_json::from_value(msg.body.clone()).unwrap();
-                                match &server {
-                                    Some(s) => {
-                                        let m = broadcast.message.clone();
-                                        if !msgs.contains(&m) {
-                                            msgs.push(m);
-                                            msgs.sort();
-                                            debug(format!("Messages at node {} is {:?}\n", &s.node_id, msgs));
-                                            for neighbour in neighbours.iter() {
-                                                if neighbour.as_str().unwrap() != msg.src {
-                                                    s.send_to_node(json!({ "type" : "broadcast", "message": m.clone() }), &neighbour.as_str().unwrap());
-                                                }
-                                            }
-                                        }
-                                        s.send( broadcast.response(), &msg )
-                                    },
-                                    None => panic!("Missing server")
-                                }
-                            },
-                            Some("read") => {
-                                let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
-                                match &server {
-                                    Some(s) => s.send( read.response(&msgs), &msg ),
-                                    None => panic!("Missing server")
-                                }
-                            }
-                            _ => {
-                                match msg.body.get("in_reply_to") {
-                                    Some(msg_id) => {
-                                        match &server {
-                                            Some(s) => s.acked(msg_id.as_u64().unwrap()),
-                                            None => panic!("Missing server")
-                                        }
-                                    },
-                                    _ => {}
-                                }
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        debug(format!("Invalid JSON {} {}\n", buffer, error));
-                    }
-                };
-                ()
-            },
-            Err(error) => return Err(error)
-        }
-    }
+struct BroadcastServer {
+    node : Option<Node>,
+    msgs : Vec<u32>,
+    neighbours : Vec<Value>
+    
 }
+
+impl Server for BroadcastServer {
+    fn process_reply(&self) {}
+    fn start(&mut self, node : Node) {
+        self.node = Some(node);
+    }
+    fn process_message(&mut self, msg : Message) {
+        let node = self.node.as_ref().unwrap();
+        match msg.body["type"].as_str() {
+            Some("topology") => {
+                let topology : Topology = serde_json::from_value(msg.body.clone()).unwrap();
+                self.neighbours = topology.topology[&node.node_id].as_array().unwrap().clone();
+                node.send( topology.response(), &msg );
+            },
+            Some("broadcast") => {
+                let broadcast : Broadcast = serde_json::from_value(msg.body.clone()).unwrap();
+                let m = broadcast.message.clone();
+                if !self.msgs.contains(&m) {
+                    self.msgs.push(m);
+                    self.msgs.sort();
+                    debug(format!("Messages at node {} is {:?}\n", &node.node_id, &self.msgs));
+                    for neighbour in self.neighbours.iter() {
+                        if neighbour.as_str().unwrap() != msg.src {
+                            node.send_to_node_async(json!({ "type" : "broadcast", "message": m.clone() }), neighbour.to_string());
+                        }
+                    }
+                }
+                node.send( broadcast.response(), &msg )
+            },
+            Some("read") => {
+                let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
+                node.send( read.response(&self.msgs), &msg )
+            },
+            _ => {}
+        }            
+    }
+    fn notify(&mut self) {}
+}
+
+fn main() -> io::Result<()> {
+    let server = BroadcastServer { 
+        node: None,
+        msgs : Vec::new(),
+        neighbours: Vec::new()
+    };
+    node::node::run(server);
+    Ok(())
+}
+

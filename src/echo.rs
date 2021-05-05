@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use serde::{Deserialize};
 use serde_json::{Value, json};
 mod node;                         
-use crate::node::node::{Node, Init, Message};
+use crate::node::node::{Server, Node, Init, Message};
 
 #[derive(Deserialize)]
 struct Echo {
@@ -19,42 +19,29 @@ impl Echo {
     }
 }
 
-fn debug(msg : String) {
-    io::stderr().write(msg.as_bytes()).expect("Failed to write debug");
+struct EchoServer {
+    node : Option<Node>
+}
+
+impl Server for EchoServer {
+    fn process_reply(&self) {}
+    fn start(&mut self, node : Node) {
+        self.node = Some(node);
+    }
+    fn process_message(&mut self, msg : Message) {
+        match msg.body["type"].as_str() {
+            Some("echo") => {
+                let echo : Echo = serde_json::from_value(msg.body.clone()).unwrap();
+                self.node.as_ref().unwrap().send( echo.response(), &msg );
+            },
+            _ => {}
+        }
+    }
+    fn notify(&mut self) {}
 }
 
 fn main() -> io::Result<()> {
-    let mut server : Option<Box<Node>> = None;
-    loop {
-        let mut buffer = String::new();
-        match io::stdin().read_line(&mut buffer) {
-            Ok(_n) => {
-                match serde_json::from_str::<Message>(buffer.as_str()) {
-                    Ok(msg) => {
-                        match msg.body["type"].as_str() {
-                            Some("init") => {
-                                let init : Init = serde_json::from_value(msg.body.clone()).unwrap();
-                                let s : Node = Node::new(&init);
-                                s.send( init.response(), &msg );
-                                server = Some(Box::new(s))                                
-                            },
-                            Some("echo") => {
-                                let echo : Echo = serde_json::from_value(msg.body.clone()).unwrap();
-                                match &server {
-                                    Some(server) => server.send( echo.response(), &msg ),
-                                    None => panic!("Missing server")
-                                }
-                            }
-                            _ => {}
-                        }
-                    },
-                    Err(error) => {
-                        debug(format!("Invalid JSON {} {}\n", buffer, error));
-                    }
-                };
-                ()
-            },
-            Err(error) => return Err(error)
-        }
-    }
+    let server = EchoServer { node: None };
+    node::node::run(server);
+    Ok(())
 }
