@@ -80,8 +80,9 @@ impl Server for BroadcastServer {
                     self.msgs.sort();
                     debug(format!("Messages at node {} is {:?}\n", &node.node_id, &self.msgs));
                     for neighbour in self.neighbours.iter() {
-                        if neighbour.as_str().unwrap() != msg.src {
-                            node.send_to_node_async(json!({ "type" : "broadcast", "message": m.clone() }), neighbour.to_string());
+                        let dest = neighbour.as_str().unwrap();
+                        if dest != msg.src {
+                            node.send_to_node_async(json!({ "type" : "broadcast", "message": m.clone() }), dest.to_string());
                         }
                     }
                 }
