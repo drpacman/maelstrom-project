@@ -1,13 +1,16 @@
 
 mod node;
 use crate::node::node::{Node, Server, Message}; 
+use std::{thread, time, fmt};
 use serde::{
-    ser::{Serialize, Serializer, SerializeSeq},
-    Deserialize
+    ser::{Serialize, Serializer},
+    Deserialize, Deserializer,
+    de::{Error, Visitor, Unexpected}
 };
 use serde_json::{Value, json};
-use std::iter::Map;
 use std::collections::{ HashMap };   
+
+const SVC : &str = "lin-kv";
 
 #[derive(Deserialize)]
 struct Txn {
@@ -31,31 +34,38 @@ impl Txn {
 #[derive(Clone)]
 struct Thunk {
     id : String,
-    value : Option<Vec<i64>>,
+    value : Option<Value>,
     saved: bool
 }
 
 impl Thunk {
-    fn value(&mut self, node: &Node) -> Vec<i64> {
-        if self.value.is_none() {
-            let resp = node.send_to_node_sync(json!({ "type": "read", "key": self.id}), "lin-kv".to_string());
+    fn value_as_vec(&mut self, node: &Node) -> Vec<i64>{
+        serde_json::from_value(self.resolve_value(node)).expect("Should be a vec of i64s")
+    }
+        
+    fn value_as_map(&mut self, node: &Node) -> HashMap<u64, Thunk> {
+        serde_json::from_value(self.resolve_value(node)).expect("Should be a map of thunks")
+    }
+
+    fn resolve_value(&mut self, node: &Node) -> Value {
+        while self.value.is_none() {
+            let resp = node.send_to_node_sync(json!({ "type": "read", "key": self.id}), SVC.to_string());
             if resp["type"] == "read_ok" {
-                let read_thunk : ReadThunk = serde_json::from_value(resp).expect("Not a read ok response");
-                self.value = Some(read_thunk.value);
+                self.value = Some(resp["value"]);
             } else {
-                panic!("Failed read");
+                thread::sleep(time::Duration::from_millis(10));
             }
         }
         self.value.as_ref().unwrap().clone()
     }
 
     fn save(&mut self, node: &Node) {
-        if let Some(value) = self.value.as_ref() {
-            let resp = node.send_to_node_sync(json!({ "type": "write", "key": self.id, "value": value}), "lin-kv".to_string());
+        while self.value.is_some() && self.saved == false {
+            let resp = node.send_to_node_sync(json!({ "type": "write", "key": self.id, "value": self.value.as_ref().unwrap()}), SVC.to_string());
             if resp["type"] == "write_ok" {
                 self.saved = true
             } else {
-                panic!("Failed to write");
+                thread::sleep(time::Duration::from_millis(10));
             }
         }
     }
@@ -70,12 +80,38 @@ impl Serialize for Thunk {
     }
 }
 
+struct ThunkVisitor;
+impl<'de> Visitor<'de> for ThunkVisitor {
+    type Value = Thunk;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "Thunk should be represented by a string")
+    }
+
+    fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+    where
+        E: Error,
+    {
+        Ok(Thunk { id: s.to_owned(), value: None, saved: false })
+    }
+}
+
+impl<'de> Deserialize<'de> for Thunk {
+    fn deserialize<D>(deserializer: D) -> Result<Thunk, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(ThunkVisitor)
+    }
+}
+
 #[derive(Deserialize)]
 struct ReadMap {
     #[serde(rename="type")]
     #[allow(dead_code)]
     type_ : String,
-    value: HashMap<u64, String>,
+    value: HashMap<u64, Thunk>,
+    #[allow(dead_code)]
     in_reply_to: u32
 }
 
@@ -85,6 +121,7 @@ struct ReadThunk {
     #[allow(dead_code)]
     type_ : String,
     value: Vec<i64>,
+    #[allow(dead_code)]
     in_reply_to: u32
 }
 
@@ -119,15 +156,11 @@ impl DatomicServer {
 
     fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
         let node = self.node.as_ref().unwrap();
-        let resp = node.send_to_node_sync(json!({ "type": "read", "key": "root"}), "lin-kv".to_string());
+        let resp = node.send_to_node_sync(json!({ "type": "read", "key": "root"}), SVC.to_string());
         if resp["type"] == "read_ok" {
             node::node::debug(format!("\nReceived read map response {:?}", resp));
             let read_map : ReadMap = serde_json::from_value(resp).expect("Not a suitable Read Map response");
-            let mut state : HashMap<u64, Thunk> = HashMap::new();
-            for (k,v) in read_map.value {
-                state.insert(k, Thunk { id: v, value: None, saved: false });
-            }
-            self.state = state;
+            self.state = read_map.value;
         }    
         let (result, mut updated_state, generator) = self.apply_transaction(txn, self.generator.clone());
         self.generator = generator;
@@ -141,7 +174,7 @@ impl DatomicServer {
             "from": self.state,
             "to" : updated_state,
             "create_if_not_exists" : true
-        }), "lin-kv".to_string());
+        }), SVC.to_string());
         node::node::debug(format!("\nReceived CAS response {:?}", cas_resp));
         if cas_resp["type"].as_str().unwrap() != "cas_ok" {
             return Err("Failed to CAS");
@@ -163,7 +196,7 @@ impl DatomicServer {
                 match action {
                     "r" => {
                         match entry {
-                            Some(thunk) => result.push(json!([ action, key, *thunk.value(node) ])),
+                            Some(thunk) => result.push(json!([ action, key, *thunk.value_as_vec(node) ])),
                             None => result.push(json!([ action, key, Value::Null ]))
                         }
                     },
@@ -171,12 +204,12 @@ impl DatomicServer {
                         let value = v.as_i64().expect("Append value should be a signed int");
                         result.push(json!([ action, key, v ]));                        
                         let mut updated_entry : Vec<i64> = match entry {
-                            Some(thunk) => thunk.value(node).clone(),
+                            Some(thunk) => thunk.value_as_vec(node).clone(),
                             None => Vec::new()
                         };
                         updated_entry.push(value);
                         let (id, new_generator) = generator.gen_id();
-                        new_state.insert(key, Thunk { id: id, value: Some(updated_entry), saved: false });
+                        new_state.insert(key, Thunk { id: id, value: Some(json!(updated_entry) ), saved: false });
                         generator = new_generator;
                     },
                     _ => {
