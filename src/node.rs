@@ -120,7 +120,6 @@ pub mod node {
     }
 
     fn send_message(resp: &Message) -> () {
-        debug(format!("\nSending message on the wire: {:?}", resp));
         io::stdout()
             .write(format!("{}\n", serde_json::to_string(resp).unwrap()).as_bytes())
             .expect("Failed to send response on stdout");
@@ -160,7 +159,7 @@ pub mod node {
                     }
                     if unacked.len() > 0 {
                         for (_m,(m, _sender)) in unacked.iter() {
-                            debug(format!("\nSending {:?}\n", &m));
+                            debug(format!("\nSending {:?}", &m));
                             send_message(&m);
                         }
                     }
