@@ -65,21 +65,20 @@ pub mod node {
                         match serde_json::from_str::<Message>(buffer.as_str()) {
                             Ok(msg) => {
                                 match msg.body.get("in_reply_to") {
-                                    Some(msg_id) => {
-                                        // debug(format!("\nRead Reply on the wire: {:?}", &msg));
-                                        reply_tx.send(msg).expect("Failed to send message read from command line");                                        
+                                    Some(_msg_id) => {
+                                        reply_tx
+                                        .send(msg)
+                                        .expect("Failed to send message read from command line");                                        
                                     },
                                     None => {
-                                        // debug(format!("\nRead Message on the wire: {:?}", &msg));
-                                        input_tx.send(msg).expect("Failed to send message read from command line");
+                                        input_tx
+                                        .send(msg)
+                                        .expect("Failed to send message read from command line");
                                     }
                                 }
                             },
-                            Err(error) => {
-                                debug(format!("Invalid JSON {} {}", buffer, error));
-                            }
-                        };
-                        ()
+                            Err(error) => debug(format!("Invalid JSON {} {}", buffer, error))
+                        }
                     },
                     Err(_error) => panic!("Failed to read from stdin")
                 }
@@ -89,18 +88,11 @@ pub mod node {
         let mut init = None;
         let mut src = String::new();
         while init.is_none() {
-            match input_rx.try_recv() {
-                Ok(msg) => {
-                    // debug(format!("\nReceived initial message{:?}",msg));
-                    match msg.body["type"].as_str() {
-                        Some("init") => {
-                            init = Some(serde_json::from_value(msg.body.clone()).unwrap());
-                            src = msg.src.to_string();
-                        },
-                        _ => {}
-                    }
-                },
-                _ => ()
+            if let Ok(msg) = input_rx.try_recv() {
+                if let Some("init") = msg.body["type"].as_str() {
+                    init = Some(serde_json::from_value(msg.body.clone()).unwrap());
+                    src = msg.src.to_string();
+                }
             };
         }
         let node : Node = Node::new(&init.unwrap(), src, reply_rx);
@@ -108,12 +100,9 @@ pub mod node {
 
         loop {                    
             server.process_reply();
-            match input_rx.try_recv() {
-                Ok(msg) => {
-                    debug(format!("\nReceived Server Message - {:?}",msg));
-                    server.process_message(msg);
-                },
-                _ => ()
+            if let Ok(msg) = input_rx.try_recv() {
+                debug(format!("\nReceived Server Message - {:?}",msg));
+                server.process_message(msg);
             };
             server.notify();
         }
@@ -144,13 +133,10 @@ pub mod node {
                             },
                             Ok(Messages::Reply(m)) => {
                                 let msg_id = m.body["in_reply_to"].as_u64().expect("In reply to is not a u64");
-                                // debug(format!("\nThere are {} unacked messages remaining - received ack for message Id {}", unacked.len(), msg_id));
-                                match unacked.get(&msg_id) {
-                                    Some((_m, Some(sender))) => {
-                                        // debug(format!("\nRecieved ack {:?}",m));
-                                        sender.send(m.body);
-                                    },
-                                    _ => {}
+                                if let Some((_m, Some(sender))) = unacked.get(&msg_id) {
+                                    sender
+                                    .send(m.body)
+                                    .expect("Failed to send message body");                                    
                                 };
                                 unacked.remove(&msg_id);
                             }
@@ -207,7 +193,6 @@ pub mod node {
         }
 
         pub fn acked(&self, m : Message) {
-            // debug(format!("\nAcking {:?}",m));
             self.tx
                 .send(Messages::Reply(m))
                 .expect("Tx send failed");
@@ -225,11 +210,8 @@ pub mod node {
         }
 
         pub fn process_reply(&self) {
-            match self.reply_rx.try_recv() {
-                Ok(msg) => {
-                    &self.acked(msg);
-                },
-                _ => {}
+            if let Ok(msg) = self.reply_rx.try_recv() {
+                &self.acked(msg);
             }
         }
     }
