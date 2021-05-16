@@ -108,9 +108,9 @@ impl<'de, T> Deserialize<'de> for Thunk<T> {
 }
 
 struct DatomicServer {
-    state : Option<MapThunk>,
+    state : ThunkCache<HashMap<u64, VecThunk>>,
     node : Option<Node>,
-    generator : IdGenerator
+    generator : IdGenerator,
 }
 
 #[derive(Clone)]
@@ -126,10 +126,32 @@ impl IdGenerator {
     }    
 }
 
+struct ThunkCache<T> {
+    cache : HashMap<String, Thunk<T>>
+}
+
+impl<T: Clone> ThunkCache<T> {
+    fn read_value(&mut self, id : String, node: &Node) -> Thunk<T> {
+        let key = id.clone();
+        let entry = self.cache.entry(id).or_insert_with(|| {
+            loop {
+                let resp = node.send_to_node_sync(json!({ "type": "read", "key": key}), SVC.to_string());
+                if resp["type"] == "read_ok" {
+                    let v : Thunk<T> = serde_json::from_value(resp["value"].clone()).expect("Not a suitable Thunk response");
+                    return v
+                } else {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        });
+        entry.clone()
+    }
+}
+
 impl DatomicServer {
     fn new () -> DatomicServer {
         DatomicServer {
-            state : None,
+            state : ThunkCache::<HashMap<u64, VecThunk>>{ cache: HashMap::new() },
             node : None,
             generator : IdGenerator{ seed:0, node_id : "".to_string() }                
         }
@@ -138,30 +160,23 @@ impl DatomicServer {
     fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
         node::node::debug(format!("\nTxn start {:?}", txn));     
         let node = self.node.as_ref().unwrap();
-        self.state = None;
-        while self.state.is_none() {
-            let resp = node.send_to_node_sync(json!({ "type": "read", "key": ROOT}), SVC.to_string());
-            if resp["type"] == "read_ok" {
-                let map_thunk : MapThunk = serde_json::from_value(resp["value"].clone()).expect("Not a suitable MapThunk response");
-                self.state = Some(map_thunk);
-            } else {
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
-        } 
-        let current_state = self.state.as_mut().unwrap().value(node); 
+        let mut current_state_thunk = self.state.read_value(ROOT.to_string(), node);
+        let current_state = current_state_thunk.value(node);
                 
         let (result, mut updated_state, generator) = self.apply_transaction(txn, current_state, self.generator.clone());
         self.generator = generator;
-        // save contents of updated state
+        // save contents of updated state entries
         for thunk in updated_state.value(node).values_mut() {
             thunk.save(node); 
         };
+        // save the map
         updated_state.save(node);
+        // update id of map pointed to by ROOT
         let cas_resp = node.send_to_node_sync(json!({ 
             "type": "cas", 
             "key": ROOT, 
-            "from": self.state,
-            "to" : updated_state,
+            "from": current_state_thunk.id,
+            "to" : updated_state.id,
             "create_if_not_exists" : true
         }), SVC.to_string());
         if cas_resp["type"].as_str().unwrap() != "cas_ok" {
@@ -220,10 +235,10 @@ impl Server for DatomicServer {
     fn start(&mut self, node : Node){
         let (id, generator) = IdGenerator{ seed:0, node_id : node.node_id.clone() }.gen_id();
         if node.node_ids[0] == node.node_id {
-            let mut rootThunk = MapThunk { id: id.clone(), value: Some(HashMap::new()), saved: false };
-            rootThunk.save(&node);
+            let mut root_thunk = MapThunk { id: id.clone(), value: Some(HashMap::new()), saved: false };
+            root_thunk.save(&node);
 
-            while true {
+            loop {
                 let resp = node.send_to_node_sync(json!({ "type": "write", "key": ROOT, "value": &id }), SVC.to_string());
                 if resp["type"] == "write_ok" {
                     node::node::debug(format!("\nSaved initial root node {:?}", id));     
