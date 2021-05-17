@@ -10,6 +10,7 @@ use serde::{
 use serde_json::{Value, json};
 use std::collections::{ HashMap };   
 use std::marker::PhantomData;
+use rand;
 
 const SVC : &str = "lww-kv";
 const ROOT : &str = "root";
@@ -47,10 +48,11 @@ impl<T : Serialize + DeserializeOwned + Clone> Thunk<T> {
         while self.value.is_none() {
             let resp = node.send_to_node_sync(json!({ "type": "read", "key": self.id}), SVC.to_string());
             if resp["type"] == "read_ok" {
+                node::node::debug(format!("\nRead {:?} - received {}", self.id, resp));
                 let value : T = serde_json::from_value(resp["value"].clone()).expect("Failed to unpack JSON for thunk");
                 self.value = Some(value);
             } else {
-                node::node::debug(format!("\nFailed to read {:?}", self.id));
+                node::node::debug(format!("\nFailed to read {:?} - received {}", self.id, resp));
                 thread::sleep(time::Duration::from_millis(10));
             }
         }
@@ -109,6 +111,7 @@ impl<'de, T> Deserialize<'de> for Thunk<T> {
 
 struct DatomicServer {
     state : ThunkCache<HashMap<u64, VecThunk>>,
+    entries : ThunkCache<Vec<i64>>,
     node : Option<Node>,
     generator : IdGenerator,
 }
@@ -131,20 +134,36 @@ struct ThunkCache<T> {
 }
 
 impl<T: Clone> ThunkCache<T> {
+    fn clear_cache_entry(&mut self, id: String) {
+        self.cache.remove(&id);
+    }
+    
+    fn read_value_no_cache(id : String, node : &Node) -> Thunk<T>  {
+        loop {
+            let resp = node.send_to_node_sync(json!({ "type": "read", "key": id}), SVC.to_string());
+            if resp["type"] == "read_ok" {
+                let v : Thunk<T> = serde_json::from_value(resp["value"].clone()).expect(format!("Not a suitable Thunk response {} for key {}", resp["value"], id).as_str());
+                return v
+            } else {
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
     fn read_value(&mut self, id : String, node: &Node) -> Thunk<T> {
         let key = id.clone();
         let entry = self.cache.entry(id).or_insert_with(|| {
-            loop {
-                let resp = node.send_to_node_sync(json!({ "type": "read", "key": key}), SVC.to_string());
-                if resp["type"] == "read_ok" {
-                    let v : Thunk<T> = serde_json::from_value(resp["value"].clone()).expect("Not a suitable Thunk response");
-                    return v
-                } else {
-                    thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
+            return ThunkCache::read_value_no_cache(key, node);
         });
         entry.clone()
+    }
+
+    fn contains(&mut self, id : String) -> bool {
+        self.cache.contains_key(&id)
+    }
+
+    fn insert_value(&mut self, t : Thunk<T>) {
+        self.cache.insert(t.id.clone(), t);
     }
 }
 
@@ -152,6 +171,7 @@ impl DatomicServer {
     fn new () -> DatomicServer {
         DatomicServer {
             state : ThunkCache::<HashMap<u64, VecThunk>>{ cache: HashMap::new() },
+            entries : ThunkCache::<Vec<i64>>{ cache: HashMap::new() },
             node : None,
             generator : IdGenerator{ seed:0, node_id : "".to_string() }                
         }
@@ -160,14 +180,20 @@ impl DatomicServer {
     fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
         node::node::debug(format!("\nTxn start {:?}", txn));     
         let node = self.node.as_ref().unwrap();
-        let mut current_state_thunk = self.state.read_value(ROOT.to_string(), node);
-        let current_state = current_state_thunk.value(node);
-                
+        let mut current_state_thunk : MapThunk = ThunkCache::read_value_no_cache(ROOT.to_string(), node);
+        let mut current_state = current_state_thunk.value(node);
+        // replace any cached vec thunks
+        for (_, val) in current_state.iter_mut() {
+            if self.entries.contains(val.id.clone()) {
+                *val = self.entries.read_value(val.id.clone(), node);
+            }
+        }
         let (result, mut updated_state, generator) = self.apply_transaction(txn, current_state, self.generator.clone());
         self.generator = generator;
         // save contents of updated state entries
         for thunk in updated_state.value(node).values_mut() {
             thunk.save(node); 
+            self.entries.insert_value(thunk.clone());
         };
         // save the map
         updated_state.save(node);
@@ -181,6 +207,9 @@ impl DatomicServer {
         }), SVC.to_string());
         if cas_resp["type"].as_str().unwrap() != "cas_ok" {
             node::node::debug(format!("\nFailed to CAS response {:?}", cas_resp));
+            self.state.clear_cache_entry(ROOT.to_string());
+            // std::thread::sleep_ms(10);
+            // return self.transact(txn);
             return Err("Failed to CAS");
         }
         node::node::debug(format!("\nTxn complete {:?}", txn));     
@@ -200,7 +229,10 @@ impl DatomicServer {
                 match action {
                     "r" => {
                         match entry {
-                            Some(thunk) => result.push(json!([ action, key, *thunk.value(node) ])),
+                            Some(thunk) => {
+                                node::node::debug(format!("\nReading thunk {} for key {}", thunk.id, key));     
+                                result.push(json!([ action, key, *thunk.value(node) ]))
+                            },
                             None => result.push(json!([ action, key, Value::Null ]))
                         }
                     },
