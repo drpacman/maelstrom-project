@@ -1,8 +1,8 @@
-use std::io::{self, Write};
+use std::io::{self};
 use serde::{Deserialize};
 use serde_json::{Value, Map, json};
 mod node;
-use crate::node::node::{Node, Server, Message};
+use crate::node::node::{debug, Node, Server, Message};
                                 
 #[derive(Deserialize)]
 struct Topology {
@@ -39,28 +39,36 @@ struct Read {
     #[serde(rename="type")]
     #[allow(dead_code)]
     type_ : String,
+    #[allow(dead_code)]
     msg_id: u32
 }
 
 impl Read {
     fn response(self, messages : &Vec<u32>) -> Value {
-        return json!({"type" : "read_ok", "in_reply_to": self.msg_id, "messages": messages})
+        return json!({"type" : "read_ok", "messages": messages})
     }
-}
-
-fn debug(msg : String) {
-    io::stderr().write(msg.as_bytes()).expect("Failed to write debug");
 }
 
 struct BroadcastServer {
     node : Option<Node>,
     msgs : Vec<u32>,
     neighbours : Vec<Value>
-    
+}
+
+impl BroadcastServer {
+    fn new() -> BroadcastServer {
+        BroadcastServer {
+                node: None,
+            msgs : Vec::new(),
+            neighbours: Vec::new()
+        }
+    }
 }
 
 impl Server for BroadcastServer {
-    fn process_reply(&self) {}
+    fn get_node_ref(&self) -> &Node {
+        self.node.as_ref().unwrap()
+    }
     fn start(&mut self, node : Node) {
         self.node = Some(node);
     }
@@ -70,7 +78,7 @@ impl Server for BroadcastServer {
             Some("topology") => {
                 let topology : Topology = serde_json::from_value(msg.body.clone()).unwrap();
                 self.neighbours = topology.topology[&node.node_id].as_array().unwrap().clone();
-                node.send( topology.response(), &msg );
+                node.send_reply( topology.response(), &msg );
             },
             Some("broadcast") => {
                 let broadcast : Broadcast = serde_json::from_value(msg.body.clone()).unwrap();
@@ -79,18 +87,13 @@ impl Server for BroadcastServer {
                     self.msgs.push(m);
                     self.msgs.sort();
                     debug(format!("Messages at node {} is {:?}\n", &node.node_id, &self.msgs));
-                    for neighbour in self.neighbours.iter() {
-                        let dest = neighbour.as_str().unwrap();
-                        if dest != msg.src {
-                            node.send_to_node_async(json!({ "type" : "broadcast", "message": m.clone() }), dest.to_string());
-                        }
-                    }
+                    node.broadcast(json!({ "type" : "broadcast", "message": m.clone() }));
                 }
-                node.send( broadcast.response(), &msg )
+                node.send_reply( broadcast.response(), &msg )
             },
             Some("read") => {
                 let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
-                node.send( read.response(&self.msgs), &msg )
+                node.send_reply( read.response(&self.msgs), &msg )
             },
             _ => {}
         }            
@@ -99,12 +102,8 @@ impl Server for BroadcastServer {
 }
 
 fn main() -> io::Result<()> {
-    let server = BroadcastServer { 
-        node: None,
-        msgs : Vec::new(),
-        neighbours: Vec::new()
-    };
-    node::node::run(server);
+    let mut server = BroadcastServer::new();
+    server.run();
     Ok(())
 }
 

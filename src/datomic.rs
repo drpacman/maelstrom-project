@@ -1,36 +1,31 @@
 
 mod node;
-use crate::node::node::{Node, Server, Message}; 
+use crate::node::node::{debug, Node, Server, Message}; 
 use std::{thread, time, fmt};
 use serde::{
     ser::{Serialize, Serializer},
     Deserialize, Deserializer,
-    de::{Error, Visitor, DeserializeOwned, Unexpected}
+    de::{Error, Visitor, DeserializeOwned}
 };
 use serde_json::{Value, json};
 use std::collections::{ HashMap };   
 use std::marker::PhantomData;
-use rand;
 
 const SVC : &str = "lww-kv";
 const ROOT : &str = "root";
 
 #[derive(Deserialize)]
 struct Txn {
-    #[serde(rename="type")]
-    #[allow(dead_code)]
-    type_ : String,
     txn: Vec<Value>,
-    msg_id: u32
 }
 
 impl Txn {
     fn response(&self, values: &Vec<Value>) -> Value {
-        return json!({ "type" : "txn_ok", "in_reply_to": self.msg_id, "txn" : values })
+        return json!({ "type" : "txn_ok", "txn" : values })
     }
 
     fn fail(&self, err: &String) -> Value {
-        return json!({ "type" : "error", "in_reply_to": self.msg_id, "code" : 30, "text": err })
+        return json!({ "type" : "error",  "code" : 30, "text": err })
     }
 }
 
@@ -48,11 +43,11 @@ impl<T : Serialize + DeserializeOwned + Clone> Thunk<T> {
         while self.value.is_none() {
             let resp = node.send_to_node_sync(json!({ "type": "read", "key": self.id}), SVC.to_string());
             if resp["type"] == "read_ok" {
-                node::node::debug(format!("\nRead {:?} - received {}", self.id, resp));
+                debug(format!("Read {:?} - received {}", self.id, resp));
                 let value : T = serde_json::from_value(resp["value"].clone()).expect("Failed to unpack JSON for thunk");
                 self.value = Some(value);
             } else {
-                node::node::debug(format!("\nFailed to read {:?} - received {}", self.id, resp));
+                debug(format!("Failed to read {:?} - received {}", self.id, resp));
                 thread::sleep(time::Duration::from_millis(10));
             }
         }
@@ -63,7 +58,7 @@ impl<T : Serialize + DeserializeOwned + Clone> Thunk<T> {
         while self.value.is_some() && self.saved == false {
             let resp = node.send_to_node_sync(json!({ "type": "write", "key": self.id, "value": self.value.as_ref().unwrap()}), SVC.to_string());
             if resp["type"] == "write_ok" {
-                node::node::debug(format!("\nSaved {:?}", self.id));
+                debug(format!("Saved {:?}", self.id));
                 self.saved = true
             } else {
                 thread::sleep(time::Duration::from_millis(10));
@@ -178,7 +173,7 @@ impl DatomicServer {
     }
 
     fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
-        node::node::debug(format!("\nTxn start {:?}", txn));     
+        debug(format!("Txn start {:?}", txn));     
         let node = self.node.as_ref().unwrap();
         let mut current_state_thunk : MapThunk = ThunkCache::read_value_no_cache(ROOT.to_string(), node);
         let mut current_state = current_state_thunk.value(node);
@@ -190,7 +185,7 @@ impl DatomicServer {
         }
         let (result, mut updated_state, generator) = self.apply_transaction(txn, current_state, self.generator.clone());
         self.generator = generator;
-        // save contents of updated state entries
+        // save contents of updated state entries and cache them
         for thunk in updated_state.value(node).values_mut() {
             thunk.save(node); 
             self.entries.insert_value(thunk.clone());
@@ -206,13 +201,13 @@ impl DatomicServer {
             "create_if_not_exists" : true
         }), SVC.to_string());
         if cas_resp["type"].as_str().unwrap() != "cas_ok" {
-            node::node::debug(format!("\nFailed to CAS response {:?}", cas_resp));
+            debug(format!("Failed to CAS response {:?}", cas_resp));
             self.state.clear_cache_entry(ROOT.to_string());
             // std::thread::sleep_ms(10);
             // return self.transact(txn);
             return Err("Failed to CAS");
         }
-        node::node::debug(format!("\nTxn complete {:?}", txn));     
+        debug(format!("Txn complete {:?}", txn));     
         Ok(result)
     }
 
@@ -230,7 +225,7 @@ impl DatomicServer {
                     "r" => {
                         match entry {
                             Some(thunk) => {
-                                node::node::debug(format!("\nReading thunk {} for key {}", thunk.id, key));     
+                                debug(format!("Reading thunk {} for key {}", thunk.id, key));     
                                 result.push(json!([ action, key, *thunk.value(node) ]))
                             },
                             None => result.push(json!([ action, key, Value::Null ]))
@@ -260,9 +255,9 @@ impl DatomicServer {
 }
 
 impl Server for DatomicServer {
-    fn process_reply(&self) {
-        self.node.as_ref().unwrap().process_reply();
-    }
+    fn get_node_ref(&self) -> &Node {
+        self.node.as_ref().unwrap()
+    }    
 
     fn start(&mut self, node : Node){
         let (id, generator) = IdGenerator{ seed:0, node_id : node.node_id.clone() }.gen_id();
@@ -273,7 +268,7 @@ impl Server for DatomicServer {
             loop {
                 let resp = node.send_to_node_sync(json!({ "type": "write", "key": ROOT, "value": &id }), SVC.to_string());
                 if resp["type"] == "write_ok" {
-                    node::node::debug(format!("\nSaved initial root node {:?}", id));     
+                    debug(format!("Saved initial root node {:?}", id));     
                     break;
                 } else {
                     thread::sleep(time::Duration::from_millis(10));
@@ -298,13 +293,13 @@ impl Server for DatomicServer {
                 panic!(format!("Unexpected message {:?}", msg));
             }
         };                
-        self.node.as_ref().unwrap().send(response, &msg)
+        self.get_node_ref().send_reply(response, &msg)
     }
     fn notify(&mut self){}
 }
 
 fn main() -> std::io::Result<()> {
-    let server = DatomicServer::new();   
-    node::node::run(server);
+    let mut server = DatomicServer::new();   
+    server.run();
     Ok(())
 }

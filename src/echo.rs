@@ -1,21 +1,17 @@
-use std::io::{self, Write};
+use std::io::{self};
 use serde::{Deserialize};
 use serde_json::{Value, json};
 mod node;                         
-use crate::node::node::{Server, Node, Init, Message};
+use crate::node::node::{Server, Node, Message};
 
 #[derive(Deserialize)]
 struct Echo {
-    #[serde(rename="type")]
-    #[allow(dead_code)]
-    type_ : String,
-    msg_id: u32,
     echo: String
 }
 
 impl Echo {
     fn response(self) -> Value {
-        return json!({ "type" : "echo_ok", "in_reply_to": self.msg_id, "echo" : self.echo })
+        return json!({ "type" : "echo_ok", "echo" : self.echo })
     }
 }
 
@@ -24,7 +20,9 @@ struct EchoServer {
 }
 
 impl Server for EchoServer {
-    fn process_reply(&self) {}
+    fn get_node_ref(&self) -> &Node {
+        self.node.as_ref().unwrap()
+    }
     fn start(&mut self, node : Node) {
         self.node = Some(node);
     }
@@ -32,7 +30,7 @@ impl Server for EchoServer {
         match msg.body["type"].as_str() {
             Some("echo") => {
                 let echo : Echo = serde_json::from_value(msg.body.clone()).unwrap();
-                self.node.as_ref().unwrap().send( echo.response(), &msg );
+                self.get_node_ref().send_reply( echo.response(), &msg );
             },
             _ => {}
         }
@@ -41,7 +39,7 @@ impl Server for EchoServer {
 }
 
 fn main() -> io::Result<()> {
-    let server = EchoServer { node: None };
-    node::node::run(server);
+    let mut server = EchoServer { node: None };
+    server.run();
     Ok(())
 }

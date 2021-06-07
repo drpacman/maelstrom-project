@@ -1,24 +1,13 @@
     
 pub mod crdt_server {
-    use std::io::{self, Write};
     use serde::{Deserialize};
     use serde_json::{Value, json};
-    use std::time::{ Instant };
-    use crate::node::node::{Node, Server, Message};                          
-    use std::cell::RefCell;
-
+    use std::time::{ SystemTime };
+    use crate::node::node::{debug, Node, Server, Message};                          
+    
     #[derive(Deserialize)]
     struct Replicate {
-        #[serde(rename="type")]
-        #[allow(dead_code)]
-        type_ : String,
         value: Value,
-        #[allow(dead_code)]
-        msg_id: u32
-    }
-
-    pub fn debug(msg : String) {
-        io::stderr().write(format!("{}\n", msg).as_bytes()).expect("Failed to write debug");
     }
 
     pub trait CRDT {
@@ -29,16 +18,11 @@ pub mod crdt_server {
     }
 
     #[derive(Deserialize)]
-    struct Read {
-        #[serde(rename="type")]
-        #[allow(dead_code)]
-        type_ : String,
-        msg_id: u32
-    }
+    struct Read {}
 
     impl Read {
         fn response(self, contents : Value) -> Value {
-            return json!({"type" : "read_ok", "in_reply_to": self.msg_id, "value": contents})
+            return json!({"type" : "read_ok", "value": contents})
         }
     }
 
@@ -46,7 +30,7 @@ pub mod crdt_server {
         node : Option<Node>,
         crdt : T,
         handler: fn(&String, &mut T, &Message) -> Value,
-        last_replication: Instant
+        last_replication: SystemTime
     }
 
     impl<T : CRDT>  CRDTServer<T>  {
@@ -55,7 +39,7 @@ pub mod crdt_server {
                 node : None,
                 crdt : crdt,
                 handler : handler,
-                last_replication: Instant::now()
+                last_replication: SystemTime::now()
             }
         }
 
@@ -74,20 +58,20 @@ pub mod crdt_server {
 
     impl<T: CRDT + Send + 'static>  Server for CRDTServer<T>  {
     
-        fn process_reply(&self) {
-            self.node.as_ref().unwrap().process_reply();
+        fn get_node_ref(&self) -> &Node {
+            self.node.as_ref().unwrap()
         }
-        
+                
         fn start(&mut self, node : Node) {
             self.node = Some(node);
-            self.last_replication = Instant::now();
         }
 
         fn notify(&mut self) {
-            let now = Instant::now();
-            if now.duration_since(self.last_replication).as_secs() > 5 {
-                self.last_replication = now;
-                self.replicate();
+            if let Ok(elapsed) = self.last_replication.elapsed() {
+                if elapsed.as_secs() > 5 {
+                    self.last_replication = SystemTime::now();
+                    self.replicate();
+                }
             };
         }    
 
@@ -100,11 +84,11 @@ pub mod crdt_server {
                 },
                 Some("read") => {
                     let read : Read = serde_json::from_value(msg.body.clone()).unwrap();
-                    n.send(read.response(self.crdt.read()), &msg );
+                    n.send_reply(read.response(self.crdt.read()), &msg );
                 }
                 _ => {
                     let resp = (self.handler)(&n.node_id, &mut self.crdt, &msg);
-                    n.send(resp, &msg);
+                    n.send_reply(resp, &msg);
                 }
             }
         }
