@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 mod node;
 use node::node::{Server, Node, Message, debug};
 use json_patch::merge;
-use std::time::SystemTime;
+use std::time::{ SystemTime, Instant };
 use std::error::Error;
-use std::fmt;
+use std::{ thread, fmt };
+use rand::Rng;
 
 const ELECTION_PERIOD_IN_MILLISECONDS : u128 = 2000;
 const STEP_DOWN_PERIOD_IN_MILLISECONDS : u128 = 2000;
@@ -15,25 +16,16 @@ const HEARTBEAT_INTERVAL : u128 = 1000;
 
 #[derive(Deserialize)]
 struct RequestVote {
-    #[serde(rename="type")]
-    #[allow(dead_code)]
-    type_ : String,
     term: u64,
     last_log_term: u64,
-    last_log_index: u64,
-    #[allow(dead_code)]
-    msg_id: u32
+    last_log_index: u64
 }
 
 #[derive(Deserialize)]
 struct RequestVoteResult {
-    #[serde(rename="type")]
-    #[allow(dead_code)]
-    type_ : String,
     term: u64,
     vote_granted: bool,
-    #[allow(dead_code)]
-    msg_id: u32
+    commit_index: u64
 }
 
 #[derive(Deserialize)]
@@ -72,14 +64,9 @@ impl AppendEntries {
 
 #[derive(Deserialize)]
 struct AppendEntriesResponse {
-    #[serde(rename="type")]
-    #[allow(dead_code)]
-    type_ : String,
     term: u64,
     next_log_index : u64,
-    success: bool,
-    #[allow(dead_code)]
-    msg_id: u32
+    success: bool
 }
 
 #[derive(Clone, Debug)]
@@ -145,14 +132,15 @@ struct RaftServer {
     replication_clock : SystemTime,
     term : u64,
     log: RaftLog,
-    votes: HashSet<String>,
+    votes: HashSet<(String, usize)>,
     voted_for : Option<String>,
     next_node_index: HashMap<String, usize>,
     match_index : HashMap<String, usize>,
     last_applied_index: usize,
     commit_index : usize,
-    election_duration_in_millis : u128,
-    leader_id : Option<String>
+    millis_till_next_election : u128,
+    leader_id : Option<String>,
+    proxied : HashMap<u64, Message>
 }
 
 #[derive(Debug)]
@@ -177,7 +165,8 @@ impl fmt::Display for RaftError {
 
 #[derive(Debug)]
 struct RaftLog {
-    entries : Vec::<RaftLogEntry>
+    entries : Vec::<RaftLogEntry>,
+    timestamps : HashMap::<usize, Instant>
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]    
@@ -189,14 +178,17 @@ struct RaftLogEntry {
 
 impl RaftLog {
     fn new() -> RaftLog {
-        let initial = vec!{ RaftLogEntry{ term: 0, operation : Value::Null, client_id : "".to_string() } };
-        RaftLog {
-            entries : initial
-        }
+        let mut log = RaftLog {
+            entries : Vec::new(),
+            timestamps : HashMap::new()
+        };
+        log.append( RaftLogEntry{ term: 0, operation : Value::Null, client_id : "".to_string() } );
+        log
     }
 
     fn append(&mut self, entry : RaftLogEntry) {
         self.entries.push( entry );
+        self.timestamps.insert( self.entries.len(), Instant::now() );
     }
 
     fn last(&self) -> RaftLogEntry {
@@ -225,6 +217,10 @@ impl RaftLog {
     fn get_entries_to(&self, from: usize, to : usize) -> Vec<RaftLogEntry> {
         self.entries[ (from+1)..to ].to_vec()
     }
+
+    fn get_latency(&self, index : usize) -> u128 {
+        self.timestamps.get(&index).unwrap().elapsed().as_millis()
+    }
 }
 
 impl RaftServer {
@@ -244,8 +240,9 @@ impl RaftServer {
             match_index: HashMap::new(),
             last_applied_index: 0,
             commit_index : 0,
-            election_duration_in_millis : ELECTION_PERIOD_IN_MILLISECONDS,
-            leader_id : None
+            millis_till_next_election : RaftServer::jitter(),
+            leader_id : None,
+            proxied: HashMap::new()
         }
     }
 
@@ -262,6 +259,7 @@ impl RaftServer {
     }
 
     fn advance_state_machine(&mut self){
+        debug("Advancing state machine".to_string());
         let entries = self.log.get_entries_to(self.last_applied_index, self.commit_index);
         for entry in entries {
             debug(format!("Applying req {}", entry.operation));
@@ -271,9 +269,9 @@ impl RaftServer {
                 let msg_id = entry.operation["msg_id"].as_i64().unwrap();        
                 let mut reply = json!({ "in_reply_to": msg_id });
                 merge(&mut reply, &resp);
-                debug(format!("Replying with {}", reply));            
+                debug(format!("Replying to {} with {}", entry.client_id, reply));
                 let node = self.node.as_ref().unwrap();
-                node.send_to_node_noack(resp, entry.client_id);
+                node.send_to_node_noack(reply, entry.client_id);
             }
         }
     }
@@ -283,7 +281,7 @@ impl RaftServer {
         self.reset_step_down_clock();
         match self.advance_term(self.term + 1) {
             Ok(()) => {
-                debug(format!("{} became CANDIDATE", self.node.as_ref().unwrap().node_id));
+                debug(format!("{} became CANDIDATE for term {}", self.node.as_ref().unwrap().node_id, self.term));
                 self.voted_for = Some(self.node.as_ref().unwrap().node_id.clone());        
                 self.request_votes(); 
             }, 
@@ -304,9 +302,10 @@ impl RaftServer {
         self.leader_id = Some(node.node_id.clone());
         self.next_node_index.clear();
         self.match_index.clear();
+        let match_index = self.votes.iter().fold(std::usize::MAX, |min_index, (_src, index)| std::cmp::min(min_index, *index));
         for node_id in node.other_node_ids() {
             self.next_node_index.insert(node_id.clone(), self.log.size());
-            self.match_index.insert(node_id.clone(), 0);
+            self.match_index.insert(node_id.clone(), match_index);
         }   
         self.reset_step_down_clock();
         debug(format!("{} became LEADER for term {}", self.node.as_ref().unwrap().node_id, self.term));
@@ -333,7 +332,7 @@ impl RaftServer {
         self.votes = HashSet::new();
         let node = self.node.as_ref().unwrap();
         // vote for yourself
-        self.votes.insert( node.node_id.clone() );
+        self.votes.insert( (node.node_id.clone(), self.commit_index) );
         node.broadcast_acked(json!({  
             "type": "request_vote",  
             "term": self.term,  
@@ -344,8 +343,12 @@ impl RaftServer {
         self.reset_step_down_clock();        
     }
 
+    fn jitter() -> u128 {
+        rand::random::<u8>() as u128
+    }
+
     fn choose_election_duration(&mut self) {
-        self.election_duration_in_millis = ELECTION_PERIOD_IN_MILLISECONDS + (rand::random::<u8>() as u128);
+        self.millis_till_next_election = ELECTION_PERIOD_IN_MILLISECONDS + RaftServer::jitter();
     }
 
     fn reset_step_down_clock(&mut self) {
@@ -391,15 +394,20 @@ impl Server for RaftServer {
     
     fn start(&mut self, node : Node) {
         self.node = Some(node);
+        thread::sleep(std::time::Duration::from_millis(rand::thread_rng().gen_range(0..5000)));
+        if self.state == RaftState::Follower {
+            self.become_candidate();
+        }
     }
 
-    fn process_message(&mut self, msg : Message) {
+    fn process_reply(&mut self, msg : Message) {
+        debug("Processing reply".to_string());
         let body = msg.body.clone();
         match body["type"].as_str() {
             Some("request_vote_res")  => {
                 let res : RequestVoteResult = serde_json::from_value(body.clone()).unwrap();
                 if self.state == RaftState::Candidate && res.vote_granted == true && res.term == self.term {
-                    self.votes.insert(msg.src);
+                    self.votes.insert( (msg.src, res.commit_index as usize ) );
                     debug(format!("Have received {:?} votes", self.votes));
                     let node = self.node.as_ref().unwrap();
                     if RaftServer::majority(node.node_ids.len()) <= self.votes.len() {
@@ -407,6 +415,49 @@ impl Server for RaftServer {
                     }
                 }
             },
+            Some("append_entries_res")  => {
+                if self.state == RaftState::Leader {
+                    let current_term = self.term;
+                    let append_entries_resp : AppendEntriesResponse = serde_json::from_value(body.clone()).unwrap();
+                    self.maybe_step_down(append_entries_resp.term);
+                    if current_term == append_entries_resp.term {
+                        if append_entries_resp.success {
+                            debug(format!("Updating next log index for {} to {}", msg.src, append_entries_resp.next_log_index));
+                            self.next_node_index.insert( msg.src.clone(), append_entries_resp.next_log_index as usize );
+                            self.match_index.insert(msg.src.clone(), append_entries_resp.next_log_index as usize);
+                            // find majority match index
+                            let median_match_index = self.median_match_index();
+                            if self.commit_index < median_match_index {
+                                // update commit index
+                                self.commit_index = median_match_index;
+                                debug(format!("Updating leader commit index to {} - commit latency is {}", self.commit_index, self.log.get_latency(self.commit_index)));
+                                self.advance_state_machine()
+                            }
+                        } else {
+                            *self.next_node_index.get_mut(&msg.src).unwrap() -= 1;
+                        }
+                    }
+                }
+            },
+            _ => {
+                let request_msg_id = body["in_reply_to"].as_u64().unwrap();
+                match self.proxied.remove(&request_msg_id) {
+                    Some(client_msg) => {
+                        debug(format!("Reply from proxied message to leader - {}", body));
+                        let node = self.node.as_ref().unwrap();
+                        node.send_reply(body, &client_msg);
+                    },
+                    None => {
+                        debug(format!("Ignored reply - {}", body));
+                    }
+                }
+            }
+        };
+    }
+
+    fn process_message(&mut self, msg : Message) {
+        let body = msg.body.clone();
+        match body["type"].as_str() {
             Some("request_vote") => {
                 // debug(format!("Processing request vote {:?}", self));
                 let mut granted = false;
@@ -430,7 +481,8 @@ impl Server for RaftServer {
                 node.send_reply(json!({ 
                     "type" : "request_vote_res",
                     "term" : self.term,
-                    "vote_granted" : granted
+                    "vote_granted" : granted,
+                    "commit_index" : self.commit_index
                 }), &msg);                
             },
             Some("append_entries") => {
@@ -471,46 +523,23 @@ impl Server for RaftServer {
                     }
                 }
             },
-            Some("append_entries_res")  => {
-                if self.state == RaftState::Leader {
-                    let current_term = self.term;
-                    let append_entries_resp : AppendEntriesResponse = serde_json::from_value(body.clone()).unwrap();                
-                    self.maybe_step_down(append_entries_resp.term);
-                    if current_term == append_entries_resp.term {
-                        if append_entries_resp.success {
-                            debug(format!("Updating next log index for {} to {}", msg.src, append_entries_resp.next_log_index));
-                            self.next_node_index.insert( msg.src.clone(), append_entries_resp.next_log_index as usize );
-                            self.match_index.insert(msg.src.clone(), append_entries_resp.next_log_index as usize);
-                            // find majority match index
-                            let median_match_index = self.median_match_index();
-                            if self.commit_index < median_match_index {
-                                // update commit index
-                                self.commit_index = median_match_index;
-                                self.advance_state_machine()                                                        
-                            }
-                        } else {
-                            *self.next_node_index.get_mut(&msg.src).unwrap() -= 1;
-                        }
-                    }
-                }
-            },
-            _ if self.state == RaftState::Leader => {                
-                self.log.append( RaftLogEntry{ term : self.term, operation: msg.body, client_id : msg.src } );
-            },
-            _ if self.leader_id.is_some() => {
-                let node = self.node.as_ref().unwrap();
-                // Proxy to leader
-                let resp = node.send_to_node_sync(body, self.leader_id.clone().unwrap());
-                node.send_reply(resp, &msg);                
-            },
             _ => {
-                let node = self.node.as_ref().unwrap();
-                node.send_reply(json!({ 
-                    "type" : "error",
-                    "code" : 11,
-                    "text" : "Not a leader so temporarily unavailable",
-                    "leader_id" : self.leader_id
-                }), &msg);  
+                if self.state == RaftState::Leader {
+                    self.log.append( RaftLogEntry{ term : self.term, operation: msg.body, client_id : msg.src } );
+                } else if self.leader_id.is_some() {
+                    let node = self.node.as_ref().unwrap();
+                    debug(format!("Proxying to leader - {}", body));
+                    let proxied_msg_id = node.send_to_node_acked(&body, self.leader_id.clone().unwrap());
+                    self.proxied.insert(proxied_msg_id, msg);
+                } else {
+                    let node = self.node.as_ref().unwrap();
+                    node.send_reply(json!({
+                        "type" : "error",
+                        "code" : 11,
+                        "text" : "No known leader so temporarily unavailable",
+                        "leader_id" : self.leader_id
+                    }), &msg);
+                }
             }
         };
     }
@@ -535,7 +564,7 @@ impl Server for RaftServer {
 
         // start election if not a leader
         if let Ok(elapsed) = self.election_clock.elapsed() {
-            if elapsed.as_millis() > self.election_duration_in_millis {
+            if elapsed.as_millis() > self.millis_till_next_election {
                  self.reset_election_deadline();
                  if self.state != RaftState::Leader {
                      self.become_candidate();

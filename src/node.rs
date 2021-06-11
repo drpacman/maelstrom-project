@@ -54,19 +54,21 @@ pub mod node {
         msg_id: Cell<u64>,
         pub node_ids: Vec<String>,
         pub node_id: String,
-        server_input_tx: Sender<Message>,
-        acks_tx: Sender<Messages>,
-        replies_rx: Receiver<Message>        
+        server_reply_tx: Sender<Message>,
+        reply_rx: Receiver<Message>,
+        acks_tx: Sender<Messages>
     }
 
     pub trait Server {
         fn start(&mut self, node : Node);
         fn get_node_ref(&self) -> &Node;
         fn process_message(&mut self, msg : Message);
+        fn process_reply(&mut self, msg : Message){}
         fn notify(&mut self);
     
         fn run(&mut self) {
             let (server_input_tx, server_input_rx) = channel();
+            let (server_reply_tx, server_reply_rx) = channel();
             let (reply_tx, reply_rx) = channel();
             let command_line_tx = server_input_tx.clone();
             thread::spawn(move || {
@@ -90,7 +92,9 @@ pub mod node {
                                         }
                                     }
                                 },
-                                Err(error) => debug(format!("Invalid JSON {} {}", buffer, error))
+                                Err(error) => {
+                                    debug(format!("Invalid JSON {} {}", buffer, error))
+                                }
                             }
                         },
                         Err(_error) => panic!("Failed to read from stdin")
@@ -102,7 +106,7 @@ pub mod node {
                 if let Ok(msg) = server_input_rx.try_recv() {
                     if let Some("init") = msg.body["type"].as_str() {
                         let init : Init = serde_json::from_value(msg.body.clone()).unwrap();
-                        let node : Node = Node::new(&init, reply_rx, server_input_tx.clone());
+                        let node : Node = Node::new(&init, reply_rx, server_reply_tx.clone());
                         node.send_reply(init.response(), &msg);
                         self.start(node);                        
                         break;
@@ -112,6 +116,10 @@ pub mod node {
             
             loop {                    
                 self.get_node_ref().process_reply();
+                if let Ok(msg) = server_reply_rx.try_recv() {
+                    debug(format!("Received Reply Message - {:?}",msg));
+                    self.process_reply(msg);
+                }
                 if let Ok(msg) = server_input_rx.try_recv() {
                     debug(format!("Received Server Message - {:?}",msg));
                     self.process_message(msg);
@@ -122,7 +130,7 @@ pub mod node {
     }
 
     fn send_message(resp: &Message) -> () {
-        // debug(format!("Sending {:?}", resp));
+        debug(format!("Sending {:?}", resp));
         io::stdout()
             .write(format!("{}\n", serde_json::to_string(resp).unwrap()).as_bytes())
             .expect("Failed to send response on stdout");
@@ -133,7 +141,7 @@ pub mod node {
     }
 
     impl Node {
-        pub fn new(init: &Init, reply_rx: Receiver<Message>, input_tx: Sender<Message>) -> Node {
+        pub fn new(init: &Init, reply_rx: Receiver<Message>, server_reply_tx: Sender<Message>) -> Node {
             let (acks_tx, acks_rx) = channel();
             
             // retry thread for "reliable" messages
@@ -147,8 +155,10 @@ pub mod node {
                                 unacked.insert(msg_id, UnackedMessage { msg: m, last_try: None, attempts: attempts, response_handler_tx: response_handler_tx });
                             },
                             Ok(Messages::Reply(m)) => {
+                                debug(format!("Got reply {:?}", m));
                                 let msg_id = m.body["in_reply_to"].as_u64().expect("In reply to is not a u64");
                                 if let Some(unacked_msg) = unacked.get(&msg_id) {
+                                    debug(format!("Handling response for {}", &msg_id));
                                     unacked_msg.response_handler_tx.send(m).expect("Failed to send message");                                    
                                 }; 
                                 unacked.remove(&msg_id);
@@ -184,9 +194,9 @@ pub mod node {
                 msg_id: Cell::new(0),
                 node_id: init.node_id.clone(),
                 node_ids: init.node_ids.clone(),
-                server_input_tx : input_tx,
-                acks_tx: acks_tx,
-                replies_rx: reply_rx
+                server_reply_tx,
+                acks_tx,
+                reply_rx
             };
             node
         }
@@ -217,10 +227,13 @@ pub mod node {
             }
         }
 
-        pub fn send_to_node_acked(&self, resp: &Value, dest: String) {
+        pub fn send_to_node_acked(&self, resp: &Value, dest: String) -> u64 {
+            let msg = self.create_message_to_send(resp, dest);
+            let msg_id = msg.body["msg_id"].as_u64().unwrap();
             self.acks_tx
-                .send(Messages::Outbound(self.create_message_to_send(resp, dest), 1, self.server_input_tx.clone()))
+                .send(Messages::Outbound(msg, 1, self.server_reply_tx.clone()))
                 .expect("Tx send failed");
+            msg_id
         }
 
         pub fn send_to_node_sync(&self, req: Value, dest: String) -> Value {
@@ -245,7 +258,8 @@ pub mod node {
         }
 
         pub fn process_reply(&self) {
-            if let Ok(msg) = self.replies_rx.try_recv() {
+            if let Ok(msg) = self.reply_rx.try_recv() {
+                debug(format!("Processing reply {:?}", msg));
                 self.acks_tx
                 .send(Messages::Reply(msg))
                 .expect("Acks tx send failed");
@@ -254,8 +268,9 @@ pub mod node {
 
         fn create_message_to_send(&self, resp: &Value, dest: String) -> Message {
             self.msg_id.set(self.msg_id.get() + 1);
-            let mut body = json!({ "msg_id": self.msg_id });
-            merge(&mut body, resp);
+            let mut body = resp.clone();
+            let msg_properties = json!({ "msg_id": self.msg_id });
+            merge(&mut body, &msg_properties);
             Message {
                 src: self.node_id.clone(),
                 dest: dest,
