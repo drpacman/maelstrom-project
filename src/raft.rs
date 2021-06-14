@@ -76,7 +76,7 @@ struct StateMachine {
 
 impl StateMachine {
     fn process(&self, operation : Value) -> (StateMachine, Value) {
-        debug(format!("Processing operation {}", operation));
+        // debug(format!("Processing operation {}", operation));
         let key = operation["key"].as_i64().unwrap();
         match operation["type"].as_str().unwrap() {
             "read" => {
@@ -242,7 +242,7 @@ impl RaftServer {
             commit_index : 0,
             millis_till_next_election : RaftServer::jitter(),
             leader_id : None,
-            proxied: HashMap::new()
+            proxied: HashMap::new(),            
         }
     }
 
@@ -262,9 +262,10 @@ impl RaftServer {
         debug("Advancing state machine".to_string());
         let entries = self.log.get_entries_to(self.last_applied_index, self.commit_index);
         for entry in entries {
-            debug(format!("Applying req {}", entry.operation));
+            // debug(format!("Applying req {}", entry.operation));
             let (next, resp) = self.state_machine.process(entry.operation.clone());            
             self.state_machine = next;
+            self.last_applied_index += 1;
             if self.state == RaftState::Leader {
                 let msg_id = entry.operation["msg_id"].as_i64().unwrap();        
                 let mut reply = json!({ "in_reply_to": msg_id });
@@ -278,6 +279,7 @@ impl RaftServer {
 
     fn become_candidate(&mut self) {
         self.state = RaftState::Candidate;
+        self.leader_id = None;
         self.reset_step_down_clock();
         match self.advance_term(self.term + 1) {
             Ok(()) => {
@@ -293,6 +295,7 @@ impl RaftServer {
 
     fn become_follower(&mut self) {
         self.state = RaftState::Follower;
+        self.leader_id = None;
         debug(format!("{} became FOLLOWER for term {}", self.node.as_ref().unwrap().node_id, self.term));
     }
 
@@ -344,7 +347,7 @@ impl RaftServer {
     }
 
     fn jitter() -> u128 {
-        rand::random::<u8>() as u128
+        rand::thread_rng().gen_range(0..500)
     }
 
     fn choose_election_duration(&mut self) {
@@ -370,7 +373,7 @@ impl RaftServer {
             let entries = self.log.get_entries_from(*node_index);
             if entries.len() > 0 || elapsed.as_millis() > HEARTBEAT_INTERVAL {
                 // debug(format!("Node index {} for node {}", node_index, node_id));
-                // debug(format!("Replicating {} entries to {}", entries.len(), &node_id));
+                debug(format!("Replicating {} entries to {}", entries.len(), &node_id));
                 let append_entries_req = json!( {
                     "type" : "append_entries",
                     "term" : self.term,
@@ -394,10 +397,6 @@ impl Server for RaftServer {
     
     fn start(&mut self, node : Node) {
         self.node = Some(node);
-        thread::sleep(std::time::Duration::from_millis(rand::thread_rng().gen_range(0..5000)));
-        if self.state == RaftState::Follower {
-            self.become_candidate();
-        }
     }
 
     fn process_reply(&mut self, msg : Message) {
@@ -421,6 +420,7 @@ impl Server for RaftServer {
                     let append_entries_resp : AppendEntriesResponse = serde_json::from_value(body.clone()).unwrap();
                     self.maybe_step_down(append_entries_resp.term);
                     if current_term == append_entries_resp.term {
+                        self.reset_step_down_clock();
                         if append_entries_resp.success {
                             debug(format!("Updating next log index for {} to {}", msg.src, append_entries_resp.next_log_index));
                             self.next_node_index.insert( msg.src.clone(), append_entries_resp.next_log_index as usize );
@@ -498,7 +498,7 @@ impl Server for RaftServer {
                 self.reset_election_deadline();
                 match self.log.log_entry(append_entries.prev_log_index as usize) {
                     Some(prev_entry) if append_entries.prev_log_term == prev_entry.term => {
-                        // trim log to prev iterm
+                        // trim log to prev item
                         self.log.truncate( (append_entries.prev_log_index + 1) as usize);
                         // append entries to log
                         for entry in append_entries.entries.iter() {
@@ -513,7 +513,7 @@ impl Server for RaftServer {
                     },
                     Some(_prev_entry) => {
                         // entry exists but terms don't match
-                        self.log.truncate((append_entries.prev_log_index - 1) as usize);
+                        self.log.truncate((append_entries.prev_log_index + 1) as usize);
                         let node = self.node.as_ref().unwrap();                
                         node.send_reply(append_entries.failure_response(), &msg)
                     },

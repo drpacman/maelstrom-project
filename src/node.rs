@@ -42,6 +42,7 @@ pub mod node {
         pub body: Value,
     }
     
+    #[derive(Debug)]
     pub struct UnackedMessage {
         msg : Message,
         response_handler_tx : Sender<Message>,
@@ -116,7 +117,7 @@ pub mod node {
             
             loop {                    
                 self.get_node_ref().process_reply();
-                if let Ok(msg) = server_reply_rx.try_recv() {
+                while let Ok(msg) = server_reply_rx.try_recv() {
                     debug(format!("Received Reply Message - {:?}",msg));
                     self.process_reply(msg);
                 }
@@ -152,7 +153,9 @@ pub mod node {
                         match acks_rx.try_recv() {
                             Ok(Messages::Outbound(m, attempts, response_handler_tx)) => {
                                 let msg_id = m.body["msg_id"].as_u64().expect("Msg Id is not a u64");
-                                unacked.insert(msg_id, UnackedMessage { msg: m, last_try: None, attempts: attempts, response_handler_tx: response_handler_tx });
+                                let msg = UnackedMessage { msg: m, last_try: None, attempts, response_handler_tx };
+                                debug(format!("Creating {:?}", msg));
+                                unacked.insert(msg_id, msg);
                             },
                             Ok(Messages::Reply(m)) => {
                                 debug(format!("Got reply {:?}", m));
@@ -182,11 +185,11 @@ pub mod node {
                         }
                         // drop all expired entries
                         for msg_id in expired_entries {
-                            debug(format!("Expiring entry {:?}",msg_id));
+                            debug(format!("Expiring entry {:?} - {:?}",msg_id, unacked.get(&msg_id)));
                             unacked.remove(&msg_id);
                         }
                     }
-                    thread::sleep(Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(1));
                 }
             });
 
@@ -258,7 +261,7 @@ pub mod node {
         }
 
         pub fn process_reply(&self) {
-            if let Ok(msg) = self.reply_rx.try_recv() {
+            while let Ok(msg) = self.reply_rx.try_recv() {
                 debug(format!("Processing reply {:?}", msg));
                 self.acks_tx
                 .send(Messages::Reply(msg))
