@@ -26,6 +26,10 @@ path="src/gcounter.rs"
 name="datomic"
 path="src/datomic.rs"
 
+[[bin]]
+name="raft"
+path="src/raft.rs"
+
 [dependencies]
 serde_json = "1.0.64"
 serde = { version = "1.0.124", features = ["derive"] }
