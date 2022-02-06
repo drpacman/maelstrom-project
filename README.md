@@ -1,0 +1,3 @@
+# maelstrom-project
+Rust implementation of the exercises from the excellent [Maelstrom](https://github.com/jepsen-io/maelstrom) distributed system tutorial.
+Learning Rust at the same time...
