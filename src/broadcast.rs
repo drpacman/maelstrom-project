@@ -2,7 +2,7 @@ use std::io::{self};
 use serde::{Deserialize};
 use serde_json::{Value, Map, json};
 mod node;
-use crate::node::node::{debug, Node, Server, Message};
+use crate::node::{debug, Node, Server, Message};
                                 
 #[derive(Deserialize)]
 struct Topology {
@@ -44,7 +44,7 @@ struct Read {
 }
 
 impl Read {
-    fn response(self, messages : &Vec<u32>) -> Value {
+    fn response(self, messages : &[u32]) -> Value {
         return json!({"type" : "read_ok", "messages": messages})
     }
 }
@@ -82,10 +82,10 @@ impl Server for BroadcastServer {
             },
             Some("broadcast") => {
                 let broadcast : Broadcast = serde_json::from_value(msg.body.clone()).unwrap();
-                let m = broadcast.message.clone();
+                let m = broadcast.message;
                 if !self.msgs.contains(&m) {
                     self.msgs.push(m);
-                    self.msgs.sort();
+                    self.msgs.sort_unstable();
                     debug(format!("Messages at node {} is {:?}\n", &node.node_id, &self.msgs));
                     node.broadcast(json!({ "type" : "broadcast", "message": m.clone() }));
                 }

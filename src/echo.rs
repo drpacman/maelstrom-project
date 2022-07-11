@@ -2,7 +2,7 @@ use std::io::{self};
 use serde::{Deserialize};
 use serde_json::{Value, json};
 mod node;                         
-use crate::node::node::{Server, Node, Message};
+use crate::node::{Server, Node, Message};
 
 #[derive(Deserialize)]
 struct Echo {
@@ -27,12 +27,9 @@ impl Server for EchoServer {
         self.node = Some(node);
     }
     fn process_message(&mut self, msg : Message) {
-        match msg.body["type"].as_str() {
-            Some("echo") => {
-                let echo : Echo = serde_json::from_value(msg.body.clone()).unwrap();
-                self.get_node_ref().send_reply( echo.response(), &msg );
-            },
-            _ => {}
+        if let Some("echo") = msg.body["type"].as_str() {
+            let echo : Echo = serde_json::from_value(msg.body.clone()).unwrap();
+            self.get_node_ref().send_reply( echo.response(), &msg );
         }
     }
     fn notify(&mut self) {}

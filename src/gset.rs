@@ -4,9 +4,9 @@ use serde_json::{Value, Number, json};
 use std::collections::HashSet;
 
 mod node; 
-use crate::node::node::{ Server, Message };
+use crate::node::{ Server, Message };
 mod crdt_server;                       
-use crate::crdt_server::crdt_server::{CRDT, CRDTServer};
+use crate::crdt_server::{Crdt, CrdtServer};
 
 #[derive(Deserialize)]
 struct Add {
@@ -29,7 +29,7 @@ impl GSet {
     }
 }
 
-impl CRDT for GSet {
+impl Crdt for GSet {
 
     fn to_json(&self) -> Value {
         Value::Array(self.set.clone().into_iter().map( |i| json!(i) ).collect())
@@ -40,7 +40,7 @@ impl CRDT for GSet {
         for entry in json.as_array().unwrap().iter() {
             set.insert(entry.as_u64().unwrap());
         }
-        GSet { set : set }
+        GSet { set }
     }
 
     fn read(&self) -> Value { 
@@ -50,20 +50,20 @@ impl CRDT for GSet {
     fn merge(&mut self, other : GSet){
         let mut merged_set : HashSet<u64> = HashSet::new();
         for &elem in self.set.iter() {
-            merged_set.insert(elem.clone());
+            merged_set.insert(elem);
         }
         for elem in other.set.into_iter() {
-            merged_set.insert(elem.clone());
+            merged_set.insert(elem);
         }
         self.set = merged_set;
     }
 }
 
-fn process_message(_node_id : &String, crdt : &mut GSet, msg : &Message) -> Value {
+fn process_message(_node_id : &str, crdt : &mut GSet, msg : &Message) -> Value {
     match msg.body["type"].as_str() {    
         Some("add") => {
             let add : Add = serde_json::from_value(msg.body.clone()).unwrap();
-            let value = add.element.as_u64().expect(format!("Expected a number, got {:?}", add.element).as_str());
+            let value = add.element.as_u64().unwrap_or_else(|| panic!("Expected a number, got {:?}", add.element));
             crdt.add(value);
             add.response()
         },
@@ -73,7 +73,7 @@ fn process_message(_node_id : &String, crdt : &mut GSet, msg : &Message) -> Valu
 
 fn main() -> Result<()> {
     let crdt = GSet{ set : HashSet::new() };
-    let mut server = CRDTServer::new(crdt, process_message);   
+    let mut server = CrdtServer::new(crdt, process_message);   
     server.run();
     Ok(())
 }

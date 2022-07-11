@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 mod node;
-use node::node::{Server, Node, Message, debug};
+use node::{Server, Node, Message, debug};
 use json_patch::merge;
 use std::time::{ SystemTime, Instant };
 use std::error::Error;
-use std::{ thread, fmt };
+use std::{ fmt };
 use rand::Rng;
 
 const ELECTION_PERIOD_IN_MILLISECONDS : u128 = 2000;
@@ -109,7 +109,7 @@ impl StateMachine {
                 }
             } ,
             op => {
-                panic!(format!("Unexpected operation {}", op));
+                panic!("Unexpected operation {}", op);
             }           
         }
     }
@@ -150,9 +150,7 @@ struct RaftError {
 
 impl RaftError {
     fn new(reason: String) -> RaftError {
-        RaftError {
-            reason: reason
-        }
+        RaftError { reason }
     }
 }
 impl Error for RaftError {}
@@ -196,10 +194,7 @@ impl RaftLog {
     }
 
     fn log_entry(&self, index : usize) -> Option<RaftLogEntry> {
-        match self.entries.get(index) {
-            Some(e) => Some(e.clone()),
-            None => None
-        }
+        self.entries.get(index).cloned()
     }
 
     fn truncate(&mut self, index : usize) {
@@ -246,8 +241,8 @@ impl RaftServer {
         }
     }
 
-    fn majority(size : usize) -> usize{
-        return size/2 + 1
+    fn majority(size : usize) -> usize {
+        size/2 + 1
     }
 
     fn median_match_index(&self) -> usize {
@@ -371,7 +366,7 @@ impl RaftServer {
                 
             let prev_entry = self.log.log_entry(node_index - 1).unwrap();
             let entries = self.log.get_entries_from(*node_index);
-            if entries.len() > 0 || elapsed.as_millis() > HEARTBEAT_INTERVAL {
+            if !entries.is_empty() || elapsed.as_millis() > HEARTBEAT_INTERVAL {
                 // debug(format!("Node index {} for node {}", node_index, node_id));
                 debug(format!("Replicating {} entries to {}", entries.len(), &node_id));
                 let append_entries_req = json!( {
@@ -405,7 +400,7 @@ impl Server for RaftServer {
         match body["type"].as_str() {
             Some("request_vote_res")  => {
                 let res : RequestVoteResult = serde_json::from_value(body.clone()).unwrap();
-                if self.state == RaftState::Candidate && res.vote_granted == true && res.term == self.term {
+                if self.state == RaftState::Candidate && res.vote_granted && res.term == self.term {
                     self.votes.insert( (msg.src, res.commit_index as usize ) );
                     debug(format!("Have received {:?} votes", self.votes));
                     let node = self.node.as_ref().unwrap();

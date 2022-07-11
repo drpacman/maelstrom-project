@@ -4,9 +4,9 @@ use serde_json::{Value, Number, json};
 use std::collections::HashMap;
 
 mod node; 
-use crate::node::node::{ Message, Server, debug };   
+use crate::node::{ Message, Server, debug };   
 mod crdt_server;                       
-use crate::crdt_server::crdt_server::{CRDT, CRDTServer};
+use crate::crdt_server::{Crdt, CrdtServer};
 
 #[derive(Deserialize)]
 struct Add {
@@ -57,7 +57,7 @@ impl PNCounter {
     }
 }
 
-impl CRDT for PNCounter {
+impl Crdt for PNCounter {
     fn to_json(&self) -> Value {
         json!({ "inc" : &self.inc.to_json(), "dec" : &self.dec.to_json() })
     }
@@ -76,7 +76,7 @@ impl CRDT for PNCounter {
     }
 }
 
-impl CRDT for GCounter {
+impl Crdt for GCounter {
 
     fn to_json(&self) -> Value {
         json!(&self.counters)
@@ -88,13 +88,13 @@ impl CRDT for GCounter {
         for (k,v) in object {
             counters.insert(k.clone(), v.as_i64().expect("Should be a number"));
         }
-        GCounter { counters : counters }
+        GCounter { counters }
     }
 
     fn read(&self) -> Value { 
         let mut sum = 0;
-        for (_k, v) in &self.counters {
-            sum = sum + v;
+        for v in self.counters.values() {
+            sum += v;
         };
         debug(format!("Counters {:?}, Sum {}", self.counters, sum));
         return json!(sum)
@@ -118,12 +118,12 @@ impl CRDT for GCounter {
     }
 }
 
-fn process_message(node_id : &String, crdt : &mut PNCounter, msg : &Message) -> Value {
+fn process_message(node_id : &str, crdt : &mut PNCounter, msg : &Message) -> Value {
     match msg.body["type"].as_str() {
         Some("add") => {
             let add : Add = serde_json::from_value(msg.body.clone()).unwrap();
-            let value = add.delta.as_i64().expect(format!("Expected a number, got {:?}", add.delta).as_str());
-            crdt.add(node_id.clone(), value);
+            let value = add.delta.as_i64().unwrap_or_else(|| panic!("Expected a number, got {:?}", add.delta));
+            crdt.add(node_id.to_string(), value);
             add.response()
         },                               
         _ => panic!("Unexpected message")
@@ -132,7 +132,7 @@ fn process_message(node_id : &String, crdt : &mut PNCounter, msg : &Message) -> 
 
 fn main() -> Result<()> {
     let crdt = PNCounter::new();
-    let mut server = CRDTServer::new(crdt, process_message);   
+    let mut server = CrdtServer::new(crdt, process_message);   
     server.run();
     Ok(())
 }

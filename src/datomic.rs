@@ -1,6 +1,6 @@
 
 mod node;
-use crate::node::node::{debug, Node, Server, Message}; 
+use crate::node::{debug, Node, Server, Message}; 
 use std::{thread, time, fmt};
 use serde::{
     ser::{Serialize, Serializer},
@@ -20,11 +20,11 @@ struct Txn {
 }
 
 impl Txn {
-    fn response(&self, values: &Vec<Value>) -> Value {
+    fn response(&self, values: &[Value]) -> Value {
         return json!({ "type" : "txn_ok", "txn" : values })
     }
 
-    fn fail(&self, err: &String) -> Value {
+    fn fail(&self, err: &str) -> Value {
         return json!({ "type" : "error",  "code" : 30, "text": err })
     }
 }
@@ -55,7 +55,7 @@ impl<T : Serialize + DeserializeOwned + Clone> Thunk<T> {
     }
 
     fn save(&mut self, node: &Node) {
-        while self.value.is_some() && self.saved == false {
+        while self.value.is_some() && !self.saved {
             let resp = node.send_to_node_sync(json!({ "type": "write", "key": self.id, "value": self.value.as_ref().unwrap()}), SVC.to_string());
             if resp["type"] == "write_ok" {
                 debug(format!("Saved {:?}", self.id));
@@ -137,7 +137,7 @@ impl<T: Clone> ThunkCache<T> {
         loop {
             let resp = node.send_to_node_sync(json!({ "type": "read", "key": id}), SVC.to_string());
             if resp["type"] == "read_ok" {
-                let v : Thunk<T> = serde_json::from_value(resp["value"].clone()).expect(format!("Not a suitable Thunk response {} for key {}", resp["value"], id).as_str());
+                let v : Thunk<T> = serde_json::from_value(resp["value"].clone()).unwrap_or_else (|_| panic!("Not a suitable Thunk response {} for key {}", resp["value"], id));
                 return v
             } else {
                 thread::sleep(std::time::Duration::from_millis(50));
@@ -148,7 +148,7 @@ impl<T: Clone> ThunkCache<T> {
     fn read_value(&mut self, id : String, node: &Node) -> Thunk<T> {
         let key = id.clone();
         let entry = self.cache.entry(id).or_insert_with(|| {
-            return ThunkCache::read_value_no_cache(key, node);
+            ThunkCache::read_value_no_cache(key, node)
         });
         entry.clone()
     }
@@ -172,7 +172,7 @@ impl DatomicServer {
         }
     }
 
-    fn transact(&mut self, txn : &Vec<Value>) -> std::result::Result<Vec<Value>, &str> {
+    fn transact(&mut self, txn : &[Value]) -> std::result::Result<Vec<Value>, &str> {
         debug(format!("Txn start {:?}", txn));     
         let node = self.node.as_ref().unwrap();
         let mut current_state_thunk : MapThunk = ThunkCache::read_value_no_cache(ROOT.to_string(), node);
@@ -211,12 +211,12 @@ impl DatomicServer {
         Ok(result)
     }
 
-    fn apply_transaction(&self, txn : &Vec<Value>, current_state : HashMap<u64, VecThunk>, id_gen : IdGenerator) -> (Vec<Value>, MapThunk, IdGenerator) {
+    fn apply_transaction(&self, txn : &[Value], current_state : HashMap<u64, VecThunk>, id_gen : IdGenerator) -> (Vec<Value>, MapThunk, IdGenerator) {
         let mut result = Vec::new();
         let node = self.node.as_ref().unwrap();  
-        let mut new_state = current_state.clone();
+        let mut new_state = current_state;
         let mut generator = id_gen;                            
-        for entry in txn.into_iter() {
+        for entry in txn.iter() {
             if let [ f, k, v ] = entry.as_array().expect("Entry should be an array").as_slice() {
                 let action = f.as_str().expect("Action should be a string");
                 let key = k.as_u64().expect("Key should be a u64");
@@ -240,17 +240,17 @@ impl DatomicServer {
                         };
                         updated_entry.push(value);
                         let (id, new_generator) = generator.gen_id();
-                        new_state.insert(key, VecThunk { id: id, value: Some(updated_entry), saved: false });
+                        new_state.insert(key, VecThunk { id, value: Some(updated_entry), saved: false });
                         generator = new_generator;
                     },
                     _ => {
-                        panic!(format!("unexpected action of ${:?}", action));
+                        panic!("unexpected action of ${:?}", action);
                     }
                 }
             }
         }
         let (id, new_generator) = generator.gen_id();                        
-        (result, MapThunk { id: id, value: Some(new_state), saved: false } , new_generator)
+        (result, MapThunk { id, value: Some(new_state), saved: false } , new_generator)
     }
 }
 
@@ -286,11 +286,11 @@ impl Server for DatomicServer {
                 let transaction_output = self.transact(&txn.txn);
                 match transaction_output {
                     Ok(values) => txn.response(&values),
-                    Err(text) => txn.fail(&text.to_string())
+                    Err(text) => txn.fail(text)
                 }
             },
             _ => {
-                panic!(format!("Unexpected message {:?}", msg));
+                panic!("Unexpected message {:?}", msg);
             }
         };                
         self.get_node_ref().send_reply(response, &msg)
